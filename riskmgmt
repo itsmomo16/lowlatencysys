@@ -1,0 +1,183 @@
+#include <cmath>
+#include "common.hpp"
+
+class AdvancedRiskManager {
+private:
+    struct RiskMetrics {
+        double gross_position;
+        double net_position;
+        double dollar_exposure;
+        double var_95;
+        double expected_shortfall;
+        double max_drawdown;
+        std::chrono::nanoseconds avg_position_duration;
+    };
+
+    struct RiskLimits {
+        double max_gross_position;
+        double max_net_position;
+        double max_dollar_exposure;
+        double var_limit;
+        double es_limit;
+        double max_drawdown_limit;
+        std::chrono::nanoseconds max_position_duration;
+        double max_order_size;
+        double max_daily_loss;
+        size_t max_daily_trades;
+    };
+
+    // Position tracking
+    struct PositionTracker {
+        double position;
+        double vwap;
+        double realized_pnl;
+        double unrealized_pnl;
+        std::deque<Trade> recent_trades;
+        std::chrono::nanoseconds last_update;
+    };
+
+    std::unordered_map<std::string, RiskMetrics> risk_metrics_;
+    std::unordered_map<std::string, RiskLimits> risk_limits_;
+    std::unordered_map<std::string, PositionTracker> positions_;
+    std::mutex risk_mutex_;
+
+    // Historical volatility calculation
+    struct VolatilityCalculator {
+        std::deque<double> price_history;
+        std::deque<double> returns;
+        size_t window_size;
+        
+        void update(double price) {
+            price_history.push_back(price);
+            if (price_history.size() > window_size) {
+                price_history.pop_front();
+            }
+            
+            if (price_history.size() > 1) {
+                double ret = std::log(price / price_history[price_history.size()-2]);
+                returns.push_back(ret);
+                if (returns.size() > window_size - 1) {
+                    returns.pop_front();
+                }
+            }
+        }
+        
+        double calculate_volatility() {
+            if (returns.size() < 2) return 0.0;
+            
+            double sum = 0.0, sum_sq = 0.0;
+            for (double ret : returns) {
+                sum += ret;
+                sum_sq += ret * ret;
+            }
+            double mean = sum / returns.size();
+            return std::sqrt((sum_sq / returns.size()) - (mean * mean));
+        }
+    };
+
+    std::unordered_map<std::string, VolatilityCalculator> volatility_calculators_;
+
+public:
+    void set_risk_limits(const std::string& symbol, const RiskLimits& limits) {
+        std::lock_guard<std::mutex> lock(risk_mutex_);
+        risk_limits_[symbol] = limits;
+    }
+
+    bool check_order(const Order& order) {
+        std::lock_guard<std::mutex> lock(risk_mutex_);
+        
+        auto limits_it = risk_limits_.find(order.symbol);
+        if (limits_it == risk_limits_.end()) {
+            return false;  // No limits set for symbol
+        }
+        
+        const auto& limits = limits_it->second;
+        auto& position = positions_[order.symbol];
+        
+        // Basic size and exposure checks
+        if (order.quantity > limits.max_order_size) {
+            return false;
+        }
+        
+        // Calculate potential new position
+        double new_position = position.position;
+        if (order.is_buy) {
+            new_position += order.quantity;
+        } else {
+            new_position -= order.quantity;
+        }
+        
+        // Check position limits
+        if (std::abs(new_position) > limits.max_net_position) {
+            return false;
+        }
+        
+        // Calculate and check VaR
+        double var = calculate_var_95(order.symbol, new_position);
+        if (var > limits.var_limit) {
+            return false;
+        }
+        
+        // Check expected shortfall
+        double es = calculate_expected_shortfall(order.symbol, new_position);
+        if (es > limits.es_limit) {
+            return false;
+        }
+        
+        return true;
+    }
+
+    void update_position(const std::string& symbol, const Trade& trade) {
+        std::lock_guard<std::mutex> lock(risk_mutex_);
+        
+        auto& position = positions_[symbol];
+        auto& metrics = risk_metrics_[symbol];
+        
+        // Update position
+        if (trade.is_buy) {
+            position.position += trade.quantity;
+        } else {
+            position.position -= trade.quantity;
+        }
+        
+        // Update VWAP
+        double old_value = position.vwap * (position.position - trade.quantity);
+        double trade_value = trade.price * trade.quantity;
+        position.vwap = (old_value + trade_value) / position.position;
+        
+        // Update PnL
+        position.unrealized_pnl = (trade.price - position.vwap) * position.position;
+        
+        // Update metrics
+        metrics.gross_position = std::abs(position.position);
+        metrics.net_position = position.position;
+        metrics.dollar_exposure = position.position * trade.price;
+        
+        // Update volatility estimate
+        volatility_calculators_[symbol].update(trade.price);
+        
+        // Store trade for recent history
+        position.recent_trades.push_back(trade);
+        while (position.recent_trades.size() > 1000) {  // Keep last 1000 trades
+            position.recent_trades.pop_front();
+        }
+    }
+
+private:
+    double calculate_var_95(const std::string& symbol, double position) {
+        auto& calc = volatility_calculators_[symbol];
+        double vol = calc.calculate_volatility();
+        
+        // Simple parametric VaR calculation
+        // In production, would use historical simulation or Monte Carlo
+        constexpr double confidence_95 = 1.645;  // Standard normal 95% confidence
+        return std::abs(position) * vol * confidence_95;
+    }
+    
+    double calculate_expected_shortfall(const std::string& symbol, double position) {
+        // Simple ES calculation based on VaR
+        // In production, would use more sophisticated methods
+        double var = calculate_var_95(symbol, position);
+        return var * 1.2;  // Approximate ES as 120% of VaR
+    }
+};
