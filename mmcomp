@@ -1,0 +1,160 @@
+#include <algorithm>
+#include <cmath>
+#include "common.hpp"
+
+class MarketMaker {
+private:
+    struct MarketMakingParams {
+        double spread_percentage;
+        double base_position_size;
+        double inventory_skew_factor;
+        double min_tick_size;
+        size_t levels;
+        double level_spacing;
+    };
+
+    struct InventoryMetrics {
+        double current_position;
+        double dollar_exposure;
+        double vwap_price;
+        std::chrono::nanoseconds position_duration;
+    };
+
+    OrderManager& order_manager_;
+    RiskManager& risk_manager_;
+    std::unordered_map<std::string, MarketMakingParams> symbol_params_;
+    std::unordered_map<std::string, InventoryMetrics> inventory_;
+    std::unordered_map<std::string, std::vector<Order>> active_orders_;
+    std::mutex maker_mutex_;
+    
+    // Volatility estimation
+    struct VolatilityEstimator {
+        std::deque<double> returns;
+        size_t window_size;
+        double current_volatility;
+        
+        void update(double price) {
+            if (!returns.empty()) {
+                double ret = std::log(price / returns.back());
+                returns.push_back(ret);
+                if (returns.size() > window_size) {
+                    returns.pop_front();
+                }
+                // Calculate rolling volatility
+                double sum = 0.0, sum_sq = 0.0;
+                for (double r : returns) {
+                    sum += r;
+                    sum_sq += r * r;
+                }
+                double mean = sum / returns.size();
+                current_volatility = std::sqrt((sum_sq / returns.size()) - (mean * mean));
+            }
+            returns.push_back(price);
+        }
+    };
+    
+    std::unordered_map<std::string, VolatilityEstimator> volatility_estimators_;
+
+public:
+    MarketMaker(OrderManager& om, RiskManager& rm) 
+        : order_manager_(om), risk_manager_(rm) {}
+
+    void configure_symbol(const std::string& symbol, 
+                        double spread_pct,
+                        double position_size,
+                        double skew_factor,
+                        double tick_size,
+                        size_t num_levels,
+                        double level_space) {
+        std::lock_guard<std::mutex> lock(maker_mutex_);
+        symbol_params_[symbol] = {
+            spread_pct, position_size, skew_factor,
+            tick_size, num_levels, level_space
+        };
+    }
+
+    void update_quotes(const std::string& symbol, const Quote& market_quote) {
+        std::lock_guard<std::mutex> lock(maker_mutex_);
+        
+        auto params_it = symbol_params_.find(symbol);
+        if (params_it == symbol_params_.end()) return;
+        
+        const auto& params = params_it->second;
+        auto& metrics = inventory_[symbol];
+        
+        // Update volatility estimate
+        volatility_estimators_[symbol].update((market_quote.bid + market_quote.ask) / 2.0);
+        double current_vol = volatility_estimators_[symbol].current_volatility;
+        
+        // Calculate inventory-adjusted spread
+        double inventory_ratio = metrics.current_position / params.base_position_size;
+        double adjusted_spread = params.spread_percentage * (1.0 + 
+            inventory_ratio * params.inventory_skew_factor * current_vol);
+        
+        // Calculate base mid price
+        double mid_price = (market_quote.bid + market_quote.ask) / 2.0;
+        
+        // Cancel existing orders
+        cancel_existing_orders(symbol);
+        
+        // Generate new quotes for multiple levels
+        for (size_t level = 0; level < params.levels; ++level) {
+            double level_multiplier = 1.0 + (level * params.level_spacing);
+            
+            // Calculate bid and ask prices with inventory skew
+            double bid_price = round_to_tick(
+                mid_price * (1.0 - adjusted_spread * level_multiplier + 
+                           inventory_ratio * params.inventory_skew_factor),
+                params.min_tick_size);
+                           
+            double ask_price = round_to_tick(
+                mid_price * (1.0 + adjusted_spread * level_multiplier + 
+                           inventory_ratio * params.inventory_skew_factor),
+                params.min_tick_size);
+            
+            // Calculate sizes based on level
+            double base_size = params.base_position_size / 
+                             std::pow(2.0, static_cast<double>(level));
+            
+            // Submit orders
+            submit_maker_order(symbol, true, bid_price, base_size);  // Bid
+            submit_maker_order(symbol, false, ask_price, base_size); // Ask
+        }
+    }
+
+private:
+    double round_to_tick(double price, double tick_size) {
+        return std::round(price / tick_size) * tick_size;
+    }
+
+    void cancel_existing_orders(const std::string& symbol) {
+        auto it = active_orders_.find(symbol);
+        if (it != active_orders_.end()) {
+            for (const auto& order : it->second) {
+                order_manager_.cancel_order(order.order_id);
+            }
+            it->second.clear();
+        }
+    }
+
+    void submit_maker_order(const std::string& symbol, bool is_buy, 
+                          double price, double size) {
+        Order order;
+        order.symbol = symbol;
+        order.is_buy = is_buy;
+        order.price = price;
+        order.quantity = size;
+        order.order_id = generate_order_id();
+        order.timestamp = get_current_timestamp();
+        
+        if (risk_manager_.check_order(order)) {
+            order_manager_.submit_order(order);
+            active_orders_[symbol].push_back(order);
+        }
+    }
+
+    std::string generate_order_id() {
+        static std::atomic<uint64_t> order_counter{0};
+        return "MM_" + std::to_string(order_counter++);
+    }
+};
